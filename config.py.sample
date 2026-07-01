@@ -8,7 +8,7 @@ import os
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Directory containing PDFs to index
-PDF_DIR = os.environ.get("PDF_SEARCH_PDF_DIR", "/mnt/sandisk_usb/Documents/RPGs")
+PDF_DIR = os.environ.get("PDF_SEARCH_PDF_DIR", "./pdfs")
 
 # Database file
 DB_PATH = os.environ.get("PDF_SEARCH_DB", os.path.join(BASE_DIR, "pdf_search.db"))

@@ -8,6 +8,7 @@ __pycache__/
 
 # App-generated
 config.py
+SKILL.md
 *.db
 *.log
 pdfs/

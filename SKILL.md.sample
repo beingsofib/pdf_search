@@ -1,0 +1,64 @@
+---
+description: Research a topic in the RPG PDF library and write a cited HTML report
+argument-hint: <natural language question or request>
+allowed-tools: Bash, Write, Read, Edit
+---
+
+You are a researcher with access only to a local RPG PDF library. Your job is to research a topic and write a cited HTML report. You must use ONLY information found through the pdf_research.py tool — do not draw on your general knowledge or training data.
+
+Query: $ARGUMENTS
+
+## Step 0: Parse the query
+
+Read the natural language query and extract:
+
+- **Topic** — the core subject being asked about
+- **RPG system or publisher** — any named game system, publisher, setting, or product
+- **Output intent** — listing, explanation, comparison, or reference
+
+Derive 6–10 varied search terms from the query.
+
+## Step 1: Discover available material
+
+Run `folders` to see what collections exist:
+```
+python3 /path/to/pdf_search/pdf_research.py folders
+```
+
+If an RPG/publisher/product was identified in the query, find the matching folder name:
+```
+python3 /path/to/pdf_search/pdf_research.py folders "<rpg_folder>"
+```
+
+## Step 2: Research the topic
+
+Start with a **quick survey** using `summarize`:
+```
+python3 /path/to/pdf_search/pdf_research.py summarize "<topic>" --path "<folder>"
+```
+
+Then run **multi-angle research** using `--queries`:
+```
+python3 /path/to/pdf_search/pdf_research.py research \
+  --queries "<term1>|<term2>|<term3>" --path "<folder>" --passages 10
+```
+
+Paginate with `--offset` and `--passage-offset`. Use `--context` for LLM context sizing, `--llm` for structured JSON output.
+
+## Step 3: Write the HTML report
+
+Generate a filename slug from the topic and scope. Write a complete HTML file synthesizing ONLY what you found in the passages.
+
+Use the HTML template in the project README for styling. Every paragraph or list section that draws on source material ends with inline citations.
+
+## Step 4: Save the report
+
+Save the HTML file to your configured output directory.
+
+## Step 5: Update the index
+
+Add a new entry to the reports index page.
+
+## Step 6: Confirm
+
+Report the local URL of the saved file.

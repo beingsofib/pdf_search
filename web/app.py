@@ -145,7 +145,7 @@ def folders():
 @app.route('/reindex', methods=['POST'])
 def reindex():
     origin = request.headers.get('Origin', '')
-    if origin and not origin.startswith(('http://192.168.', 'http://localhost', 'http://127.0.0.1', 'https://home.zinjalabs.com')):
+    if origin and not origin.startswith(('http://localhost', 'http://127.0.0.1')):
         return jsonify({'error': 'forbidden'}), 403
     if _indexer_status['running']:
         return jsonify({'status': 'already_running'})

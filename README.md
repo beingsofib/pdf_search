@@ -91,7 +91,7 @@ Edit `config.py` or set environment variables:
 
 | Variable | Default | Description |
 |---|---|---|
-| `PDF_SEARCH_PDF_DIR` | `/mnt/sandisk_usb/Documents/RPGs` | Directory containing PDFs |
+| `PDF_SEARCH_PDF_DIR` | `./pdfs` | Directory containing PDFs |
 | `PDF_SEARCH_DB` | `./pdf_search.db` | SQLite database path |
 | `PDF_SEARCH_HOST` | `0.0.0.0` | Web server bind address |
 | `PDF_SEARCH_PORT` | `5000` | Web server port |
