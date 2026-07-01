@@ -1,402 +1,48 @@
 #!/usr/bin/env python3
 """
-PDF Search web interface.
-Flask app with full-text search, folder browsing, and PDF serving.
+PDF Search web interface — Flask routes.
+
+All heavy lifting is delegated to focused modules:
+  db.py        — database helpers
+  textproc.py  — text cleaning, heading extraction, passage extraction
+  search.py    — query parsing, FTS5 query building, full-text search
+  research.py  — multi-query dedup, context trimming, view transforms
+  indexer.py   — background indexer with status tracking
 """
 
-from html import escape as html_escape, unescape as html_unescape
 import logging
 import os
 import re
-import sqlite3
 import sys
 import threading
-import time
 
-from collections import Counter
+from html import escape as html_escape
 from flask import Flask, render_template, request, send_file, jsonify, abort, Response
 
-# Allow imports from the project root
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
-from extractor import init_db, scan_directory
+
+try:
+    from .db import get_db, format_size, make_result, PDF_DIR_PREFIX, init_app
+    from .textproc import clean_text, STOPWORDS, extract_semantic_passages
+    from .search import do_search, escape_like, extract_search_terms
+    from .research import run_multi_query, apply_context_trimming, apply_view, _parse_context_size
+    from .indexer import status as _indexer_status, run as _run_indexer, start_periodic
+except ImportError:
+    from db import get_db, format_size, make_result, PDF_DIR_PREFIX, init_app
+    from textproc import clean_text, STOPWORDS, extract_semantic_passages
+    from search import do_search, escape_like, extract_search_terms
+    from research import run_multi_query, apply_context_trimming, apply_view, _parse_context_size
+    from indexer import status as _indexer_status, run as _run_indexer, start_periodic
 
 app = Flask(__name__)
+init_app(app)
 logger = logging.getLogger(__name__)
 
-# --- Indexer state ---
-_indexer_lock = threading.Lock()
-_indexer_status = {
-    'running': False,
-    'last_run': None,
-    'message': '',
-    'error': None,
-}
 
-
-def _run_indexer():
-    """Run the extractor in a background thread."""
-    with _indexer_lock:
-        if _indexer_status['running']:
-            return
-        _indexer_status['running'] = True
-        _indexer_status['error'] = None
-        _indexer_status['message'] = 'Starting...'
-
-    def _on_progress(msg):
-        _indexer_status['message'] = msg
-
-    try:
-        init_db(config.DB_PATH)
-        scan_directory(config.PDF_DIR, config.DB_PATH, progress_callback=_on_progress,
-                       use_threads=True)
-        _indexer_status['last_run'] = time.strftime('%Y-%m-%d %H:%M:%S')
-        _indexer_status['message'] = ''
-    except Exception as e:
-        logger.exception("Indexer error")
-        _indexer_status['error'] = str(e)
-        _indexer_status['message'] = ''
-    finally:
-        _indexer_status['running'] = False
-
-
-def _periodic_indexer(interval=3600):
-    """Run the indexer on startup, then every `interval` seconds."""
-    while True:
-        _run_indexer()
-        time.sleep(interval)
-
-
-STOPWORDS = frozenset({
-    'a', 'an', 'and', 'are', 'as', 'at', 'be', 'by', 'for', 'from',
-    'has', 'he', 'in', 'is', 'it', 'its', 'of', 'on', 'that', 'the',
-    'to', 'was', 'will', 'with'
-})
-
-
-def get_db():
-    conn = sqlite3.connect(config.DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
-
-
-def format_size(size_bytes):
-    if size_bytes is None:
-        return "0 B"
-    for unit in ['B', 'KB', 'MB', 'GB']:
-        if size_bytes < 1024.0:
-            return f"{size_bytes:.1f} {unit}"
-        size_bytes /= 1024.0
-    return f"{size_bytes:.1f} TB"
-
-
-_PDF_DIR_PREFIX = config.PDF_DIR if config.PDF_DIR.endswith('/') else config.PDF_DIR + '/'
-
-
-def _make_result(row):
-    """Build a result dict from a database row."""
-    return {
-        'id': row['id'], 'filename': row['filename'],
-        'path': row['pdf_path'].removeprefix(_PDF_DIR_PREFIX),
-        'size': format_size(row['file_size']),
-        'modified': row['modified_date'] or '',
-        'snippet': '',
-    }
-
-
-def _highlight_excerpt(excerpt, terms, partial_terms=None):
-    """Escape an excerpt and wrap matching terms in <mark> tags.
-
-    partial_terms: set of term strings that use substring (no word-boundary) matching.
-    All other terms are matched at word boundaries only.
-    """
-    if not excerpt:
-        return ''
-    text = html_escape(excerpt.strip())
-    partial_terms = partial_terms or set()
-    for term in terms:
-        escaped = re.escape(html_escape(term))
-        if term.lower() in partial_terms:
-            pattern = re.compile(escaped, re.IGNORECASE)
-        else:
-            pattern = re.compile(r'\b' + escaped + r'\b', re.IGNORECASE)
-        text = pattern.sub(lambda m: f'<mark>{m.group()}</mark>', text)
-    return '...' + text + '...'
-
-
-def _escape_like(value):
-    """Escape LIKE wildcard characters in a value."""
-    return value.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
-
-
-def _parse_query(query):
-    """Parse search query. Returns (search_words, path_filter, filename_only)."""
-    words = []
-    path_filter = None
-    filename_only = False
-
-    path_match = re.search(r'path:"([^"]+)"|path:(\S+)', query)
-    if path_match:
-        path_filter = path_match.group(1) or path_match.group(2)
-        query = re.sub(r'path:"[^"]+"', '', query)
-        query = re.sub(r'path:\S+', '', query)
-
-    for token in query.split():
-        if token.startswith('filename:'):
-            words.append(token[9:])
-            filename_only = True
-        elif token.strip():
-            words.append(token)
-
-    return words, path_filter, filename_only
-
-
-def _build_fts_query(raw):
-    """Translate user search syntax into an FTS5 query string.
-
-    Supported syntax:
-      "exact phrase"   — phrase match
-      -word            — exclude term (NOT)
-      word1 OR word2   — match either term
-      word*            — prefix match
-      word1 NEAR/N word2 — proximity search
-    """
-    fts_parts = []
-
-    # 1. Extract NEAR expressions (e.g. dragon NEAR/5 lair)
-    near_re = r'(\S+)\s+NEAR/(\d+)\s+(\S+)'
-    for m in re.finditer(near_re, raw, re.IGNORECASE):
-        fts_parts.append(f'NEAR("{m.group(1)}" "{m.group(3)}", {m.group(2)})')
-    raw = re.sub(near_re, '', raw, flags=re.IGNORECASE)
-
-    # 2. Extract quoted phrases
-    for m in re.finditer(r'"([^"]+)"', raw):
-        fts_parts.append(f'"{m.group(1)}"')
-    raw = re.sub(r'"[^"]*"', '', raw)
-
-    # 3. Process remaining tokens
-    tokens = raw.split()
-    i = 0
-    while i < len(tokens):
-        token = tokens[i]
-
-        # OR operator: combine previous part with next token
-        if token.upper() == 'OR' and fts_parts and i + 1 < len(tokens):
-            prev = fts_parts.pop()
-            nxt = tokens[i + 1]
-            if nxt.startswith('-'):
-                fts_parts.append(prev)
-            elif nxt.endswith('*'):
-                fts_parts.append(f'{prev} OR {nxt}')
-            else:
-                fts_parts.append(f'{prev} OR "{nxt}"')
-            i += 2
-            continue
-
-        # NOT: -word
-        if token.startswith('-') and len(token) > 1:
-            word = token[1:]
-            fts_parts.append(f'NOT "{word}"')
-            i += 1
-            continue
-
-        # Prefix: word*
-        if token.endswith('*') and len(token) > 1:
-            fts_parts.append(token)
-            i += 1
-            continue
-
-        # Partial/substring match: *word* — strip stars, treat as whole-word FTS5 term
-        if token.startswith('*') and token.endswith('*') and len(token) > 2:
-            word = token[1:-1]
-            if word.lower() not in STOPWORDS and len(word) > 1:
-                fts_parts.append(f'"{word}"')
-            i += 1
-            continue
-
-        # Regular word — skip stopwords
-        if token.lower() not in STOPWORDS and len(token) > 1:
-            fts_parts.append(f'"{token}"')
-
-        i += 1
-
-    return ' '.join(fts_parts)
-
-
-def do_search(query):
-    """Run a full-text search. Returns a list of result dicts."""
-    search_words, path_filter, filename_only = _parse_query(query)
-    raw = ' '.join(search_words)
-
-    fts_query = _build_fts_query(raw)
-    if not fts_query:
-        return []
-
-    # Build filename query: strip NOT/NEAR/OR, keep phrases and plain words
-    fn_phrases = re.findall(r'"([^"]+)"', raw)
-    fn_remaining = re.sub(r'"[^"]*"', '', raw)
-    fn_words = [w for w in fn_remaining.split()
-                if not w.startswith('-') and w.upper() != 'OR'
-                and not re.match(r'NEAR/\d+', w, re.IGNORECASE)
-                and len(w) > 1 and w.lower() not in STOPWORDS]
-    filename_parts = [f'filename:"{p}"' for p in fn_phrases]
-    filename_parts += [f'filename:"{w.rstrip("*")}"' for w in fn_words]
-    filename_query = ' '.join(filename_parts) if filename_parts else fts_query
-
-    path_clause = ""
-    params_extra = []
-    if path_filter:
-        path_clause = " AND d.pdf_path LIKE ? ESCAPE '\\'"
-        params_extra = [f'%{_escape_like(path_filter)}%']
-
-    conn = get_db()
-    c = conn.cursor()
-    results = []
-    seen_ids = set()
-    ranked_rows = []
-
-    try:
-        # Pass 1: rank without snippets (fast)
-        # Filename matches first
-        c.execute(f"""
-            SELECT d.id, d.filename, d.pdf_path, d.file_size, d.modified_date,
-                   -1000.0 as score
-            FROM documents_fts
-            JOIN documents d ON d.id = documents_fts.rowid
-            WHERE documents_fts MATCH ?{path_clause}
-            ORDER BY score
-        """, [filename_query] + params_extra)
-
-        for row in c.fetchall():
-            seen_ids.add(row['id'])
-            ranked_rows.append(row)
-
-        # Content matches
-        if not filename_only:
-            c.execute(f"""
-                SELECT d.id, d.filename, d.pdf_path, d.file_size, d.modified_date,
-                       bm25(documents_fts, 10000.0, 1.0) as score
-                FROM documents_fts
-                JOIN documents d ON d.id = documents_fts.rowid
-                WHERE documents_fts MATCH ?{path_clause}
-                ORDER BY score
-            """, [fts_query] + params_extra)
-
-            for row in c.fetchall():
-                if row['id'] not in seen_ids:
-                    ranked_rows.append(row)
-
-        # Pass 2: extract snippet windows in SQL (avoids slow FTS5 snippet())
-        if ranked_rows:
-            # Extract search terms for snippet highlighting
-            # Strip leading/trailing * from *word* partial-match tokens
-            partial_terms = {w[1:-1].lower() for w in raw.split()
-                             if w.startswith('*') and w.endswith('*') and len(w) > 2}
-            terms = [w.strip('"*').lower() for w in raw.split()
-                     if w.upper() != 'OR' and not w.startswith('-')
-                     and not re.match(r'NEAR/\d+', w, re.IGNORECASE)]
-            # Use the full quoted phrase (if any) so the snippet is centered on
-            # where the phrase actually appears, not just the first word in it.
-            phrase_match = re.search(r'"([^"]+)"', raw)
-            first_term = phrase_match.group(1).lower() if phrase_match else (terms[0] if terms else '')
-
-            ids = [row['id'] for row in ranked_rows]
-            placeholders = ','.join('?' * len(ids))
-            c.execute(f"""
-                SELECT rowid as id, content
-                FROM documents_fts
-                WHERE rowid IN ({placeholders})
-            """, ids)
-
-            # Build a word-boundary regex for the first term so the excerpt is
-            # centered on an actual whole-word match, not a substring occurrence.
-            if first_term:
-                if first_term in partial_terms:
-                    _ft_re = re.compile(re.escape(first_term), re.IGNORECASE)
-                else:
-                    _ft_re = re.compile(r'\b' + re.escape(first_term) + r'\b', re.IGNORECASE)
-            else:
-                _ft_re = None
-
-            excerpt_map = {}
-            for row in c.fetchall():
-                content = html_unescape((row['content'] or '').replace('\ufffd', '').replace('\f', ''))
-                pos = 0
-                if _ft_re and content:
-                    m = _ft_re.search(content)
-                    if m:
-                        pos = m.start()
-                excerpt_map[row['id']] = content[max(0, pos - 80):pos + 200]
-
-            for row in ranked_rows:
-                result = _make_result(row)
-                excerpt = excerpt_map.get(row['id'], '')
-                result['snippet'] = _highlight_excerpt(excerpt, terms, partial_terms)
-                results.append(result)
-    except sqlite3.OperationalError:
-        pass
-    finally:
-        conn.close()
-
-    return results
-
-
-def clean_text(raw):
-    """Fast regex cleanup of raw pdftotext output."""
-    if not raw:
-        return ''
-
-    # Remove repeated header/footer lines (appear on multiple form-feed pages)
-    pages = raw.split('\f')
-    if len(pages) > 2:
-        line_counts = Counter()
-        for page in pages:
-            lines = page.strip().splitlines()
-            # Check first and last 3 lines of each page
-            candidates = lines[:3] + lines[-3:]
-            for line in candidates:
-                stripped = line.strip()
-                if stripped:
-                    line_counts[stripped] += 1
-        # Lines appearing on >40% of pages are likely headers/footers
-        threshold = max(3, len(pages) * 0.4)
-        repeated = {line for line, count in line_counts.items() if count >= threshold}
-        if repeated:
-            cleaned_pages = []
-            for page in pages:
-                lines = page.splitlines()
-                cleaned_pages.append('\n'.join(
-                    line for line in lines if line.strip() not in repeated
-                ))
-            raw = '\n'.join(cleaned_pages)
-
-    # Strip form-feed and Unicode replacement characters
-    raw = raw.replace('\f', '').replace('\ufffd', '')
-
-    # Fix hyphenated line breaks: word-\n -> word
-    raw = re.sub(r'(\w)-\n(\w)', r'\1\2', raw)
-
-    # Strip trailing whitespace per line
-    raw = re.sub(r'[ \t]+$', '', raw, flags=re.MULTILINE)
-
-    # Collapse multiple spaces to single (preserve newlines)
-    raw = re.sub(r'[^\S\n]+', ' ', raw)
-
-    # Rejoin paragraph lines broken by pdftotext column wrapping.
-    # Join when the line ends mid-sentence (lowercase, comma, or "the/a/of/and"
-    # style words) and the next line continues text (not a blank line).
-    # Also join when a line ends with a lowercase word and the next starts
-    # with a capital (handles proper nouns mid-sentence like "the\nTumbledowns").
-    raw = re.sub(r'([a-z,;:\-])\n(?!\n)(\S)', r'\1 \2', raw)
-
-    # Collapse 3+ consecutive blank lines to 2
-    raw = re.sub(r'\n{3,}', '\n\n', raw)
-
-    return raw.strip()
-
-
-# --- Routes ---
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 
 @app.route('/')
 def index():
@@ -405,8 +51,7 @@ def index():
         c = conn.cursor()
         c.execute("SELECT COUNT(*) as count FROM documents")
         total_docs = c.fetchone()['count']
-        conn.close()
-    except sqlite3.OperationalError:
+    except Exception:
         total_docs = 0
     return render_template('index.html', total_docs=total_docs,
                            site_title=config.SITE_TITLE)
@@ -424,8 +69,7 @@ def search():
 @app.route('/browse')
 def browse():
     path = request.args.get('path', '').strip()
-    base = _PDF_DIR_PREFIX
-    full_path = base + path + '/' if path else base
+    full_path = PDF_DIR_PREFIX + path + '/' if path else PDF_DIR_PREFIX
 
     results = []
     try:
@@ -435,14 +79,13 @@ def browse():
             SELECT id, filename, pdf_path, file_size, modified_date
             FROM documents WHERE pdf_path LIKE ? ESCAPE '\\'
             ORDER BY filename
-        """, (_escape_like(full_path) + '%',))
+        """, (escape_like(full_path) + '%',))
 
         for row in c.fetchall():
             rel_from_folder = row['pdf_path'][len(full_path):]
             if '/' not in rel_from_folder:
-                results.append(_make_result(row))
-        conn.close()
-    except sqlite3.OperationalError:
+                results.append(make_result(row))
+    except Exception:
         pass
     return jsonify({'results': results, 'count': len(results), 'path': path})
 
@@ -453,7 +96,6 @@ def serve_pdf(doc_id):
     c = conn.cursor()
     c.execute("SELECT pdf_path, filename FROM documents WHERE id = ?", (doc_id,))
     row = c.fetchone()
-    conn.close()
     if not row:
         return "PDF not found", 404
     if not os.path.exists(row['pdf_path']):
@@ -470,8 +112,7 @@ def stats():
         total_docs = c.fetchone()['count']
         c.execute("SELECT SUM(file_size) as total_size FROM documents")
         total_size = c.fetchone()['total_size'] or 0
-        conn.close()
-    except sqlite3.OperationalError:
+    except Exception:
         total_docs = 0
         total_size = 0
     return jsonify({'total_documents': total_docs, 'total_size': format_size(total_size)})
@@ -480,23 +121,21 @@ def stats():
 @app.route('/folders')
 def folders():
     path = request.args.get('path', '').strip()
-    base = _PDF_DIR_PREFIX
-    full_base = base + path + '/' if path else base
+    full_base = PDF_DIR_PREFIX + path + '/' if path else PDF_DIR_PREFIX
 
     folders_dict = {}
     try:
         conn = get_db()
         c = conn.cursor()
         c.execute("SELECT pdf_path FROM documents WHERE pdf_path LIKE ? ESCAPE '\\'",
-                  (_escape_like(full_base) + '%',))
+                  (escape_like(full_base) + '%',))
 
         for row in c.fetchall():
             rel = row['pdf_path'][len(full_base):]
             if '/' in rel:
                 folder = rel.split('/')[0]
                 folders_dict[folder] = folders_dict.get(folder, 0) + 1
-        conn.close()
-    except sqlite3.OperationalError:
+    except Exception:
         pass
 
     folders_list = [{'name': k, 'count': v} for k, v in sorted(folders_dict.items())]
@@ -510,7 +149,7 @@ def reindex():
         return jsonify({'error': 'forbidden'}), 403
     if _indexer_status['running']:
         return jsonify({'status': 'already_running'})
-    t = threading.Thread(target=_run_indexer, daemon=True)
+    t = threading.Thread(target=_run_indexer, args=(config.DB_PATH, config.PDF_DIR), daemon=True)
     t.start()
     return jsonify({'status': 'started'})
 
@@ -527,36 +166,26 @@ def text_view(doc_id):
     c.execute("SELECT id, filename, pdf_path FROM documents WHERE id = ?", (doc_id,))
     doc = c.fetchone()
     if not doc:
-        conn.close()
         abort(404)
     c.execute("SELECT content FROM documents_fts WHERE rowid = ?", (doc_id,))
     fts_row = c.fetchone()
-    conn.close()
     if not fts_row or not fts_row['content']:
         abort(404)
+
     cleaned = clean_text(fts_row['content'])
     content_html = ''.join(
         '<p>' + html_escape(para).replace('\n', '<br>') + '</p>'
         for para in cleaned.split('\n\n') if para.strip()
     )
+
     query = request.args.get('q', '').strip()
-    # Extract highlight terms (strip operators, quotes, path/filename prefixes)
     highlight_terms = []
     partial_highlight_terms = []
     if query:
-        raw_q = re.sub(r'path:"[^"]+"|path:\S+', '', query)
-        raw_q = re.sub(r'filename:\S+', '', raw_q)
-        for phrase in re.findall(r'"([^"]+)"', raw_q):
-            highlight_terms.append(phrase)
-        raw_q = re.sub(r'"[^"]*"', '', raw_q)
-        for token in raw_q.split():
-            if (token.upper() != 'OR' and not token.startswith('-')
-                    and not re.match(r'NEAR/\d+', token, re.IGNORECASE)
-                    and len(token) > 1):
-                if token.startswith('*') and token.endswith('*') and len(token) > 2:
-                    partial_highlight_terms.append(token[1:-1])
-                elif token.lower() not in STOPWORDS:
-                    highlight_terms.append(token.rstrip('*'))
+        terms, partial_terms = extract_search_terms(query)
+        highlight_terms = terms
+        partial_highlight_terms = list(partial_terms)
+
     return render_template('text.html', filename=doc['filename'], doc_id=doc_id,
                            content_html=content_html, site_title=config.SITE_TITLE,
                            highlight_terms=highlight_terms,
@@ -570,11 +199,9 @@ def text_download(doc_id):
     c.execute("SELECT filename FROM documents WHERE id = ?", (doc_id,))
     doc = c.fetchone()
     if not doc:
-        conn.close()
         abort(404)
     c.execute("SELECT content FROM documents_fts WHERE rowid = ?", (doc_id,))
     fts_row = c.fetchone()
-    conn.close()
     if not fts_row or not fts_row['content']:
         abort(404)
     cleaned = clean_text(fts_row['content'])
@@ -589,91 +216,83 @@ def text_download(doc_id):
 @app.route('/api/research')
 def research_api():
     query = request.args.get('q', '').strip()
-    if not query:
-        return jsonify({'error': 'missing q parameter'}), 400
+    queries = request.args.get('queries', '').strip()
+    if not query and not queries:
+        return jsonify({'error': 'missing q or queries parameter'}), 400
 
     limit = min(int(request.args.get('limit', 20)), 20)
     offset = max(int(request.args.get('offset', 0)), 0)
     max_passages = min(int(request.args.get('passages', 10)), 50)
     passage_offset = max(int(request.args.get('passage_offset', 0)), 0)
-    all_results = do_search(query)
-    search_results = all_results[offset:offset + limit]
+    context_paragraphs = max(int(request.args.get('context', 1)), 0)
+    try:
+        context_tokens = _parse_context_size(request.args.get('context_tokens', ''))
+    except ValueError:
+        return jsonify({'error': 'invalid context_tokens value'}), 400
+    view = request.args.get('view', 'default')
+    path_filter = request.args.get('path', '').strip()
 
-    if not search_results:
-        return jsonify({'query': query, 'total': len(all_results), 'offset': offset, 'limit': limit, 'results': []})
+    # Multi-query mode
+    if queries:
+        data = run_multi_query(
+            queries, limit=limit, offset=offset,
+            max_passages=max_passages, passage_offset=passage_offset,
+            context_paragraphs=context_paragraphs,
+            path=path_filter,
+        )
+    else:
+        if path_filter:
+            query = f'{query} path:"{path_filter}"'
+        all_results = do_search(query)
+        search_results = all_results[offset:offset + limit]
 
-    # Extract search terms for passage extraction
-    words, _, _ = _parse_query(query)
-    terms = [w.strip('"*').lower() for w in words
-             if w.upper() != 'OR' and not w.startswith('-')
-             and not re.match(r'NEAR/\\d+', w, re.IGNORECASE)]
+        if not search_results:
+            data = {'query': query, 'total': len(all_results), 'offset': offset, 'limit': limit, 'results': []}
+        else:
+            terms, _ = extract_search_terms(query)
 
-    conn = get_db()
-    c = conn.cursor()
-    results = []
+            conn = get_db()
+            c = conn.cursor()
+            results = []
 
-    for sr in search_results:
-        c.execute("SELECT content FROM documents_fts WHERE rowid = ?", (sr['id'],))
-        row = c.fetchone()
-        if not row or not row['content']:
-            continue
+            for sr in search_results:
+                c.execute("SELECT content FROM documents_fts WHERE rowid = ?", (sr['id'],))
+                row = c.fetchone()
+                if not row or not row['content']:
+                    continue
 
-        content = row['content']
-        content_lower = content.lower()
+                passages, total_passages, headings = extract_semantic_passages(
+                    row['content'], terms,
+                    max_passages=max_passages,
+                    passage_offset=passage_offset,
+                    context_paragraphs=context_paragraphs,
+                )
 
-        # Find all non-overlapping match positions
-        # Extract partial terms (*word*) for substring matching; others use word boundaries
-        words_raw, _, _ = _parse_query(query)
-        raw_for_partial = ' '.join(words_raw)
-        api_partial_terms = {w[1:-1].lower() for w in raw_for_partial.split()
-                             if w.startswith('*') and w.endswith('*') and len(w) > 2}
+                if passages or total_passages > 0:
+                    results.append({
+                        'id': sr['id'],
+                        'filename': sr['filename'],
+                        'path': sr['path'],
+                        'total_passages': total_passages,
+                        'passage_offset': passage_offset,
+                        'passages': passages,
+                        'headings': [h[0] for h in headings],
+                    })
 
-        all_ranges = []
-        for term in terms:
-            term_lower = term.lower()
-            if term_lower in api_partial_terms:
-                pattern = re.compile(re.escape(term_lower), re.IGNORECASE)
-            else:
-                pattern = re.compile(r'\b' + re.escape(term_lower) + r'\b', re.IGNORECASE)
-            for m in pattern.finditer(content_lower):
-                pos = m.start()
-                window_start = max(0, pos - 500)
-                window_end = min(len(content), pos + len(term) + 500)
-                overlaps = False
-                for rs, re_ in all_ranges:
-                    overlap = min(window_end, re_) - max(window_start, rs)
-                    if overlap > 200:
-                        overlaps = True
-                        break
-                if not overlaps:
-                    all_ranges.append((window_start, window_end))
+            data = {'query': query, 'total': len(all_results), 'offset': offset, 'limit': limit, 'results': results}
 
-        total_passages = len(all_ranges)
-        # Extract only the requested slice
-        selected_ranges = all_ranges[passage_offset:passage_offset + max_passages]
-        passages = []
-        for ws, we in selected_ranges:
-            passage = clean_text(content[ws:we])
-            if passage:
-                passages.append(passage)
+    # Apply context-size trimming and view transformations
+    data = apply_context_trimming(data, context_tokens)
+    data = apply_view(data, view)
 
-        if passages or total_passages > 0:
-            results.append({
-                'id': sr['id'],
-                'filename': sr['filename'],
-                'path': sr['path'],
-                'total_passages': total_passages,
-                'passage_offset': passage_offset,
-                'passages': passages,
-            })
+    return jsonify(data)
 
-    conn.close()
-    return jsonify({'query': query, 'total': len(all_results), 'offset': offset, 'limit': limit, 'results': results})
 
+# ---------------------------------------------------------------------------
+# Startup
+# ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
-    # In debug mode, Flask's reloader spawns a child process. Only start the
-    # indexer in the child (WERKZEUG_RUN_MAIN is set) or when not in debug mode.
     if os.environ.get('WERKZEUG_RUN_MAIN') == 'true' or not app.debug:
-        threading.Thread(target=_periodic_indexer, daemon=True).start()
+        threading.Thread(target=start_periodic, args=(config.DB_PATH, config.PDF_DIR), daemon=True).start()
     app.run(host=config.HOST, port=config.PORT, debug=False)

@@ -65,6 +65,16 @@ def init_db(db_path):
             failed_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS schema_version (
+            version INTEGER PRIMARY KEY,
+            applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    c.execute("SELECT MAX(version) FROM schema_version")
+    max_ver = c.fetchone()[0]
+    if max_ver is None:
+        c.execute("INSERT INTO schema_version (version) VALUES (1)")
     conn.commit()
     conn.close()
 
@@ -101,7 +111,7 @@ def _extract_worker(pdf_path):
     }
 
 
-def scan_directory(directory, db_path, progress_callback=None, use_threads=False):
+def scan_directory(directory, db_path, progress_callback=None, use_threads=True):
     """Scan a directory tree for PDFs and index them."""
     def _progress(msg):
         if progress_callback:
@@ -191,13 +201,24 @@ def scan_directory(directory, db_path, progress_callback=None, use_threads=False
 
             if existing:
                 doc_id = existing[0]
-                c.execute("""
-                    UPDATE documents
-                    SET extracted_date = CURRENT_TIMESTAMP,
-                        file_size = ?, modified_date = ?
-                    WHERE id = ?
-                """, (result['file_size'], result['modified_date'], doc_id))
-                c.execute("DELETE FROM documents_fts WHERE rowid = ?", (doc_id,))
+                c.execute("BEGIN")
+                try:
+                    c.execute("""
+                        UPDATE documents
+                        SET extracted_date = CURRENT_TIMESTAMP,
+                            file_size = ?, modified_date = ?
+                        WHERE id = ?
+                    """, (result['file_size'], result['modified_date'], doc_id))
+                    c.execute("DELETE FROM documents_fts WHERE rowid = ?", (doc_id,))
+                    c.execute("""
+                        INSERT INTO documents_fts (rowid, filename, content)
+                        VALUES (?, ?, ?)
+                    """, (doc_id, result['filename'], result['text']))
+                    c.execute("COMMIT")
+                except Exception:
+                    c.execute("ROLLBACK")
+                    print(f"  FTS update failed for: {result['filename']}")
+                    continue
             else:
                 c.execute("""
                     INSERT INTO documents (pdf_path, filename, file_size, modified_date)
@@ -205,11 +226,10 @@ def scan_directory(directory, db_path, progress_callback=None, use_threads=False
                 """, (pdf_path, result['filename'],
                       result['file_size'], result['modified_date']))
                 doc_id = c.lastrowid
-
-            c.execute("""
-                INSERT INTO documents_fts (rowid, filename, content)
-                VALUES (?, ?, ?)
-            """, (doc_id, result['filename'], result['text']))
+                c.execute("""
+                    INSERT INTO documents_fts (rowid, filename, content)
+                    VALUES (?, ?, ?)
+                """, (doc_id, result['filename'], result['text']))
 
             processed += 1
             batch_count += 1

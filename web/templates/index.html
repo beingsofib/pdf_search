@@ -489,7 +489,7 @@
             const container = document.getElementById('results-container');
             container.innerHTML = '<div class="results-info">Searching...</div>';
 
-            fetch('/search?q=' + encodeURIComponent(query))
+            fetch('./search?q=' + encodeURIComponent(query))
                 .then(r => r.json())
                 .then(data => {
                     currentResults = data.results;
@@ -506,7 +506,7 @@
             const container = document.getElementById('results-container');
             container.innerHTML = '<div class="results-info">Loading files...</div>';
 
-            fetch('/browse?path=' + encodeURIComponent(path))
+            fetch('./browse?path=' + encodeURIComponent(path))
                 .then(r => r.json())
                 .then(data => {
                     currentResults = data.results;
@@ -575,7 +575,7 @@
             updatePageBreadcrumbs(path);
             document.getElementById('folder-filter').value = '';
             document.getElementById('folders-list').innerHTML = '<div style="color: #aaa;">Loading...</div>';
-            const url = path ? '/folders?path=' + encodeURIComponent(path) : '/folders';
+            const url = path ? './folders?path=' + encodeURIComponent(path) : './folders';
 
             fetch(url)
                 .then(r => r.json())
@@ -652,7 +652,7 @@
         }
 
         function refreshDocCount() {
-            fetch('/stats').then(function(r) { return r.json(); }).then(function(s) {
+            fetch('./stats').then(function(r) { return r.json(); }).then(function(s) {
                 document.querySelector('.stats').firstChild.textContent = s.total_documents + ' documents indexed \u00b7 ';
             });
         }
@@ -677,7 +677,7 @@
 
         function triggerReindex() {
             setReindexStatus('Updating index...');
-            fetch('/reindex', { method: 'POST' })
+            fetch('./reindex', { method: 'POST', credentials: 'include' })
                 .then(function(r) { return r.json(); })
                 .then(function() { pollReindexStatus(); })
                 .catch(function() { setReindexStatus('Error starting re-index. ' + updateLink()); });
@@ -686,7 +686,7 @@
         function pollReindexStatus() {
             if (_reindexPoll) clearInterval(_reindexPoll);
             _reindexPoll = setInterval(function() {
-                fetch('/reindex/status')
+                fetch('./reindex/status')
                     .then(function(r) { return r.json(); })
                     .then(function(data) {
                         if (data.running) {
